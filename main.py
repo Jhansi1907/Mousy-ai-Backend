@@ -107,7 +107,10 @@ def extract_location(message, default="Hyderabad"):
     return default
 
 
-# Weather cache reduces repeated Open-Meteo requests.
+# -----------------------------------------
+# WEATHER CACHE AND RATE LIMIT PROTECTION
+# -----------------------------------------
+
 _weather_cache = {}
 _geo_cache = {}
 _weather_lock = threading.Lock()
@@ -152,6 +155,63 @@ def _weather_request(url, params):
     response.raise_for_status()
     return response.json()
 
+
+# -----------------------------------------
+# OPENWEATHER BACKUP PROVIDER
+# -----------------------------------------
+
+def get_openweather(location):
+    key = os.getenv("OPENWEATHER_API_KEY")
+
+    if not key:
+        raise RuntimeError(
+            "OPENWEATHER_API_KEY is not configured"
+        )
+
+    response = requests.get(
+        "https://api.openweathermap.org/data/2.5/weather",
+        params={
+            "q": location,
+            "appid": key,
+            "units": "metric",
+        },
+        timeout=12,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    main = data["main"]
+    description = data["weather"][0]["description"]
+    name = data.get("name", location)
+    country = data.get("sys", {}).get("country", "")
+
+    reply = (
+        f"The current weather in {name}, {country}, "
+        f"is {main['temp']} degrees Celsius "
+        f"with {description}. "
+        f"It feels like {main['feels_like']} degrees. "
+        f"Humidity is {main['humidity']} percent."
+    )
+
+    return {
+        "reply": reply,
+        "sources": [
+            {
+                "title": "OpenWeather",
+                "url": "https://openweathermap.org/",
+            }
+        ],
+        "weather_observed_at": datetime.fromtimestamp(
+            data["dt"],
+            timezone.utc,
+        ).isoformat(),
+    }
+
+
+# -----------------------------------------
+# PRIMARY WEATHER PROVIDER + FALLBACK
+# -----------------------------------------
 
 def get_weather(location):
     key = location.strip().casefold()
@@ -276,14 +336,41 @@ def get_weather(location):
         requests.RequestException,
         RuntimeError,
         ValueError,
+        KeyError,
+        TypeError,
     ) as exc:
 
         logger.warning(
-            "Weather provider unavailable for %s: %s",
+            "Open-Meteo unavailable for %s: %s",
             location,
             exc,
         )
 
+        # Automatically try OpenWeather.
+        try:
+            result = get_openweather(location)
+
+            with _weather_lock:
+                _weather_cache[key] = (
+                    time.time(),
+                    result,
+                )
+
+            logger.info(
+                "OpenWeather fallback succeeded for %s",
+                location,
+            )
+
+            return result
+
+        except Exception as fallback_error:
+            logger.warning(
+                "OpenWeather fallback failed for %s: %s",
+                location,
+                fallback_error,
+            )
+
+        # Use older cached data only if both providers fail.
         with _weather_lock:
             cached = _weather_cache.get(key)
 
@@ -293,16 +380,20 @@ def get_weather(location):
             < WEATHER_STALE_SECONDS
         ):
             result = dict(cached[1])
-
             result["reply"] = (
                 "Latest available weather, not live: "
                 + result["reply"]
             )
-
             return result
 
-        raise
+        raise RuntimeError(
+            "Both weather providers are unavailable"
+        ) from exc
 
+
+# -----------------------------------------
+# NEWS ARTICLE IMAGES
+# -----------------------------------------
 
 def get_article_image(entry):
     for field in ("media_thumbnail", "media_content"):
@@ -367,6 +458,10 @@ def get_article_image(entry):
 
     return ""
 
+
+# -----------------------------------------
+# LOCATION-BASED NEWS
+# -----------------------------------------
 
 def get_news(location):
     query = f"{location} news when:2d"
@@ -449,6 +544,10 @@ def make_news_reply(location, articles):
 
     return reply
 
+
+# -----------------------------------------
+# CHAT ENDPOINT
+# -----------------------------------------
 
 @app.post("/api/chat")
 def chat(request: ChatRequest):
